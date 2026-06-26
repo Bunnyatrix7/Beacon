@@ -1,4 +1,4 @@
-const API = `${window.location.protocol}//${window.location.hostname || 'localhost'}:8080/api`;
+const API = import.meta.env.VITE_API_URL ? `${import.meta.env.VITE_API_URL}/api` : `http://localhost:8080/api`;
 export const getToken = () => localStorage.getItem('beaconToken');
 export function saveSession(session) { localStorage.setItem('beaconToken', session.token); }
 export function clearSession() { localStorage.removeItem('beaconToken'); }
