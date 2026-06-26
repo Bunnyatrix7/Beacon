@@ -9,6 +9,7 @@ import { Server } from 'socket.io';
 import { z } from 'zod';
 import { db, migrate } from './db.js';
 import { authenticate, signToken, verifyToken } from './auth.js';
+import { startLanServer, stopLanServer } from './lan.js';
 
 migrate();
 const app = express(); const server = http.createServer(app);
@@ -22,7 +23,7 @@ const notify = (userId,type,payload) => { const x=db.prepare('INSERT INTO notifi
 
 app.get('/api/health',(_q,r)=>r.json({status:'ok'}));
 app.post('/api/auth/register', asyncRoute(async(req,res)=>{ const s=z.object({fullname:z.string().trim().min(2).max(80),username:z.string().trim().regex(/^[a-zA-Z0-9_]{3,24}$/),age:z.coerce.number().int().min(13).max(120),gender:z.string().min(1).max(30),password:z.string().min(8).max(72),confirmPassword:z.string()}).refine(x=>x.password===x.confirmPassword,{message:'Passwords do not match.',path:['confirmPassword']}); const p=s.parse(req.body); if(db.prepare('SELECT 1 FROM users WHERE username=?').get(p.username)) return res.status(409).json({message:'That username is already taken.'}); const hash=await bcrypt.hash(p.password,12); const x=db.prepare('INSERT INTO users(fullname,username,age,gender,passwordHash) VALUES(?,?,?,?,?)').run(p.fullname,p.username,p.age,p.gender,hash); const u=db.prepare('SELECT * FROM users WHERE id=?').get(x.lastInsertRowid); res.status(201).json({message:'Account created. Please log in.',username:u.username}); }));
-app.post('/api/auth/login', asyncRoute(async(req,res)=>{ const p=z.object({username:z.string().trim(),password:z.string()}).parse(req.body); const u=db.prepare('SELECT * FROM users WHERE username=?').get(p.username); if(!u||!await bcrypt.compare(p.password,u.passwordHash)) return res.status(401).json({message:'Incorrect username or password.'}); res.json({token:signToken(u),user:publicUser(u)}); }));
+app.post('/api/auth/login', asyncRoute(async(req,res)=>{ const p=z.object({username:z.string().trim(),password:z.string()}).parse(req.body); const u=db.prepare('SELECT * FROM users WHERE username=?').get(p.username); if(!u||!await bcrypt.compare(p.password,u.passwordHash)) return res.status(401).json({message:'Incorrect username or password.'}); db.prepare('UPDATE users SET lastLoginAt = CURRENT_TIMESTAMP WHERE id = ?').run(u.id); res.json({token:signToken(u),user:publicUser(u)}); }));
 app.get('/api/auth/me',authenticate,(req,res)=>{ const u=db.prepare('SELECT * FROM users WHERE id=?').get(req.user.sub); if(!u)return res.status(404).json({message:'Account not found.'}); res.json(publicUser(u)); });
 app.get('/api/bootstrap',authenticate,(req,res)=>{ const id=+req.user.sub; const users=db.prepare('SELECT id,fullname,username,age,gender,onlineStatus,createdAt FROM users WHERE id<>? ORDER BY onlineStatus DESC,fullname').all(id).map(publicUser); const connections=db.prepare("SELECT c.id,c.status,u.id userId,u.fullname,u.username,u.age,u.gender,u.onlineStatus,u.createdAt FROM connections c JOIN users u ON u.id=CASE WHEN c.senderId=? THEN c.receiverId ELSE c.senderId END WHERE (c.senderId=? OR c.receiverId=?) AND c.status='accepted'").all(id,id,id).map(x=>({...x,onlineStatus:Boolean(x.onlineStatus)})); const channels=db.prepare('SELECT c.*,cm.role,(SELECT COUNT(*) FROM channel_members WHERE channelId=c.id) memberCount,(SELECT COUNT(*) FROM channel_members x JOIN users u ON u.id=x.userId WHERE x.channelId=c.id AND u.onlineStatus=1) onlineCount FROM channels c JOIN channel_members cm ON cm.channelId=c.id WHERE cm.userId=? AND c.id<>1').all(id); const notifications=db.prepare('SELECT * FROM notifications WHERE userId=? ORDER BY id DESC LIMIT 50').all(id).map(x=>({...x,payload:JSON.parse(x.payload),isRead:Boolean(x.isRead)})); res.json({users,connections,channels,notifications}); });
 app.get('/api/messages',authenticate,(req,res)=>{ const id=+req.user.sub,limit=Math.min(+req.query.limit||50,100),before=+req.query.before||Number.MAX_SAFE_INTEGER; let rows; if(req.query.channelId) rows=db.prepare('SELECT m.*,u.username,u.fullname FROM messages m JOIN users u ON u.id=m.senderId WHERE m.channelId=? AND m.id<? ORDER BY m.id DESC LIMIT ?').all(+req.query.channelId,before,limit); else { const other=+req.query.userId; rows=db.prepare('SELECT m.*,u.username,u.fullname FROM messages m JOIN users u ON u.id=m.senderId WHERE ((senderId=? AND receiverId=?) OR (senderId=? AND receiverId=?)) AND m.id<? ORDER BY m.id DESC LIMIT ?').all(id,other,other,id,before,limit); } res.json(rows.reverse()); });
@@ -32,7 +33,7 @@ app.delete('/api/users/me',authenticate,(req,res)=>{ db.prepare('DELETE FROM use
 function createConnectionRequest(from,to,res){if(from===to)return res.status(400).json({message:'You cannot connect with yourself.'});if(db.prepare("SELECT 1 FROM connections WHERE status='accepted' AND ((senderId=? AND receiverId=?) OR (senderId=? AND receiverId=?))").get(from,to,to,from))return res.status(409).json({message:'Already connected.'});const pending=db.prepare("SELECT * FROM connection_requests WHERE status='pending' AND ((senderId=? AND receiverId=?) OR (senderId=? AND receiverId=?))").get(from,to,to,from);if(pending)return res.status(409).json({message:pending.senderId===from?'Connection request already sent.':'This user already sent you a request. Check notifications.'});const x=db.prepare("INSERT INTO connection_requests(senderId,receiverId,status) VALUES(?,?,'pending') ON CONFLICT(senderId,receiverId) DO UPDATE SET status='pending',createdAt=CURRENT_TIMESTAMP").run(from,to);const request=db.prepare("SELECT * FROM connection_requests WHERE senderId=? AND receiverId=?").get(from,to);const sender=publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(from));const n=notify(to,'connection_request',{connectionId:request.id,from:sender});io.to(`user:${to}`).emit('connection_request',{id:request.id,from:sender,notification:n});return res.status(201).json({id:request.id,status:'pending'});}
 app.post('/api/connections/by-username',authenticate,(req,res)=>{const username=z.string().trim().min(1).parse(req.body.username);const target=db.prepare('SELECT id FROM users WHERE username=?').get(username);if(!target)return res.status(404).json({message:'User not found.'});return createConnectionRequest(+req.user.sub,target.id,res);});
 app.post('/api/connections/:userId',authenticate,(req,res)=>createConnectionRequest(+req.user.sub,+req.params.userId,res));
-app.patch('/api/connections/:id',authenticate,(req,res)=>{ const status=z.enum(['accepted','rejected']).parse(req.body.status); const c=db.prepare("SELECT * FROM connection_requests WHERE id=? AND receiverId=? AND status='pending'").get(req.params.id,req.user.sub);if(!c)return res.status(404).json({message:'Request not found.'});if(status==='accepted'){db.prepare("INSERT OR IGNORE INTO connections(senderId,receiverId,status) VALUES(?,?,'accepted')").run(c.senderId,c.receiverId);db.prepare('DELETE FROM connection_requests WHERE id=?').run(c.id);notify(c.senderId,'connection_accept',{connectionId:c.id,userId:+req.user.sub});const update={id:c.id,status:'accepted',userId:+req.user.sub};io.to(`user:${c.senderId}`).to(`user:${c.receiverId}`).emit('connection_accepted',update);io.to(`user:${c.senderId}`).to(`user:${c.receiverId}`).emit('connection_accept',update);}else{db.prepare("UPDATE connection_requests SET status='rejected' WHERE id=?").run(c.id);io.to(`user:${c.senderId}`).emit('connection_rejected',{id:c.id,status});}res.json({id:c.id,status}); });
+app.patch('/api/connections/:id',authenticate,(req,res)=>{ const status=z.enum(['accepted','rejected']).parse(req.body.status); const c=db.prepare("SELECT * FROM connections WHERE id=? AND receiverId=? AND status='pending'").get(req.params.id,req.user.sub);if(!c)return res.status(404).json({message:'Request not found.'});if(status==='accepted'){db.prepare("UPDATE connections SET status='accepted' WHERE id=?").run(c.id);notify(c.senderId,'connection_accept',{connectionId:c.id,userId:+req.user.sub});const update={id:c.id,status:'accepted',userId:+req.user.sub};io.to(`user:${c.senderId}`).to(`user:${c.receiverId}`).emit('connection_accepted',update);io.to(`user:${c.senderId}`).to(`user:${c.receiverId}`).emit('connection_accept',update);}else{db.prepare("UPDATE connections SET status='rejected' WHERE id=?").run(c.id);io.to(`user:${c.senderId}`).emit('connection_rejected',{id:c.id,status});}res.json({id:c.id,status}); });
 app.delete('/api/connections/user/:userId',authenticate,(req,res)=>{const me=+req.user.sub,other=+req.params.userId;const result=db.prepare("DELETE FROM connections WHERE status='accepted' AND ((senderId=? AND receiverId=?) OR (senderId=? AND receiverId=?))").run(me,other,other,me);if(!result.changes)return res.status(404).json({message:'Connection not found.'});io.to(`user:${me}`).to(`user:${other}`).emit('connection_removed',{userIds:[me,other]});res.status(204).end();});
 app.post('/api/channels',authenticate,asyncRoute(async(req,res)=>{ const p=z.object({name:z.string().trim().min(2).max(60),channelUsername:z.string().trim().regex(/^[a-zA-Z0-9_-]{3,30}$/),password:z.string().max(72).optional(),members:z.array(z.string()).default([])}).parse(req.body); const members=[...new Set(p.members.map(x=>x.toLowerCase()).filter(x=>x!==req.user.username.toLowerCase()))]; const found=db.prepare(`SELECT id,username FROM users WHERE username IN (${members.map(()=>'?').join(',')||"''"})`).all(...members); if(found.length!==members.length)return res.status(400).json({message:'One or more usernames do not exist.'}); const hash=p.password?await bcrypt.hash(p.password,12):null; const tx=db.transaction(()=>{ const x=db.prepare('INSERT INTO channels(name,channelUsername,passwordHash,createdBy) VALUES(?,?,?,?)').run(p.name,p.channelUsername,hash,req.user.sub); db.prepare("INSERT INTO channel_members(channelId,userId,role) VALUES(?,?,'admin')").run(x.lastInsertRowid,req.user.sub); for(const u of found)notify(u.id,'channel_invitation',{channelId:Number(x.lastInsertRowid),channelName:p.name,invitedBy:req.user.username}); return Number(x.lastInsertRowid);}); const id=tx(); const channel=db.prepare('SELECT * FROM channels WHERE id=?').get(id);res.status(201).json(channel); }));
 app.post('/api/channels/join',authenticate,asyncRoute(async(req,res)=>{const p=z.object({channelUsername:z.string().trim(),password:z.string().default('')}).parse(req.body);const c=db.prepare('SELECT * FROM channels WHERE channelUsername=? AND id<>1').get(p.channelUsername);if(!c||c.passwordHash&&!await bcrypt.compare(p.password,c.passwordHash))return res.status(401).json({message:'Invalid channel username or password.'});db.prepare("INSERT OR IGNORE INTO channel_members(channelId,userId,role) VALUES(?,?,'member')").run(c.id,req.user.sub);res.json(c);}));
@@ -55,4 +56,48 @@ io.on('connection',socket=>{ const id=+socket.user.sub; socket.join(`user:${id}`
   socket.on('disconnect',()=>{const left=(online.get(id)||1)-1;if(left<=0){online.delete(id);db.prepare('UPDATE users SET onlineStatus=0 WHERE id=?').run(id);io.emit('user_offline',{userId:id});broadcastPresence();}else online.set(id,left);});
 });
 app.use((err,_req,res,_next)=>{if(err instanceof z.ZodError)return res.status(400).json({message:err.issues[0]?.message||'Invalid input.',issues:err.issues});if(err.code?.startsWith('SQLITE_CONSTRAINT'))return res.status(409).json({message:'That value already exists.'});console.error(err);res.status(500).json({message:'Unexpected server error.'});});
+let lanServer = null;
+app.post('/api/lan/host', authenticate, (req, res) => {
+  if (lanServer) return res.status(409).json({ message: 'LAN server already running.' });
+  const port = Number(process.env.LAN_PORT) || 8081;
+  lanServer = startLanServer(port, origin);
+  const address = `http://localhost:${port}`;
+  res.json({ message: `LAN server started on ${address}`, address });
+});
+
+app.post('/api/lan/stop', authenticate, (req, res) => {
+  if (!lanServer) return res.status(409).json({ message: 'LAN server not running.' });
+  stopLanServer();
+  lanServer = null;
+  res.json({ message: 'LAN server stopped.' });
+});
+
+// Schedule a daily cleanup of inactive users.
+const cleanupInactiveUsers = () => {
+  // Users who haven't logged in for 15 days, or who registered 15 days ago and never logged in.
+  // The General user (id=1) is excluded from cleanup.
+  console.log('Running inactive user cleanup task...');
+  try {
+    const inactiveUsers = db.prepare(`
+      SELECT id FROM users
+      WHERE id <> 1 AND (
+        (lastLoginAt IS NOT NULL AND lastLoginAt < datetime('now', '-15 days')) OR
+        (lastLoginAt IS NULL AND createdAt < datetime('now', '-15 days'))
+      )
+    `).all();
+
+    if (inactiveUsers.length > 0) {
+      const idsToDelete = inactiveUsers.map(u => u.id);
+      const placeholders = idsToDelete.map(() => '?').join(',');
+      db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...idsToDelete);
+      
+      idsToDelete.forEach(id => io.in(`user:${id}`).disconnectSockets());
+
+      console.log(`Cleaned up ${idsToDelete.length} inactive user(s).`);
+    }
+  } catch (error) { console.error('Error during inactive user cleanup:', error); }
+};
+setInterval(cleanupInactiveUsers, 24 * 60 * 60 * 1000); // Run once every 24 hours
+cleanupInactiveUsers(); // Also run on startup
+
 server.listen(Number(process.env.PORT)||8080,'0.0.0.0',()=>console.log(`Beacon listening on http://0.0.0.0:${process.env.PORT||8080}`));

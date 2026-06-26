@@ -72,7 +72,7 @@ export default function AuthPage({ onAuthenticated }) {
               </p>
             </div>
             <div className="grid max-w-xl gap-3 sm:grid-cols-3">
-              {["Stored users", "Private login", "15 day cleanup"].map((item) => (
+              {["Stored users", "Private login", "15-day cleanup"].map((item) => (
                 <div key={item} className="rounded-[20px] border border-[var(--glass-border)] bg-[var(--glass-soft)] px-4 py-3 text-sm text-[var(--text-secondary)]">
                   {item}
                 </div>

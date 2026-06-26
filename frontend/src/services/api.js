@@ -10,3 +10,6 @@ export async function api(path, options={}) {
 }
 export const loginUser = payload => api('/auth/login',{method:'POST',body:JSON.stringify(payload)});
 export const registerUser = payload => api('/auth/register',{method:'POST',body:JSON.stringify(payload)});
+
+export const hostLan = () => api('/lan/host', { method: 'POST' });
+export const stopLan = () => api('/lan/stop', { method: 'POST' });

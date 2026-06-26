@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import AuthPage from "./components/auth/AuthPage.jsx";
 import { ThemeProvider } from "./context/ThemeContext.jsx";
 import AppShell from "./components/layout/AppShell.jsx";
-import { api, clearSession, getToken, saveSession } from './services/api.js';
+import { api, clearSession, getToken, saveSession, hostLan, stopLan } from './services/api.js';
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [checking, setChecking] = useState(Boolean(getToken()));
+  const [lanAddress, setLanAddress] = useState(null);
 
   useEffect(() => {
     if(!getToken()) return;
@@ -16,10 +17,42 @@ export default function App() {
   const authenticated = session => { saveSession(session); setUser(session.user); };
   const logout = () => { clearSession(); setUser(null); };
 
+  const handleHostLan = async () => {
+    try {
+      const { address } = await hostLan();
+      setLanAddress(address);
+    } catch (error) {
+      console.error("Failed to host LAN", error);
+    }
+  };
+
+  const handleJoinLan = (address) => {
+    setLanAddress(address);
+  };
+
+  const handleStopLan = async () => {
+    try {
+      await stopLan();
+      setLanAddress(null);
+    } catch (error) {
+      console.error("Failed to stop LAN", error);
+      // even if it fails, we should probably clear the address
+      setLanAddress(null);
+    }
+  };
+
   return (
     <ThemeProvider>
       {checking ? <div className="grid min-h-screen place-items-center bg-slate-950 text-cyan-200">Opening Beacon…</div> : user ? (
-        <AppShell user={user} onUserChange={setUser} onLogout={logout} />
+        <AppShell
+          user={user}
+          onUserChange={setUser}
+          onLogout={logout}
+          lanAddress={lanAddress}
+          onHostLan={handleHostLan}
+          onJoinLan={handleJoinLan}
+          onStopLan={handleStopLan}
+        />
       ) : (
         <AuthPage onAuthenticated={authenticated} />
       )}
